@@ -1,0 +1,120 @@
+---
+title: "DESeq2 analysis of samples two vs two"
+output:
+  html_document:
+    df_print: paged
+---
+
+This notebook tries to explain the protocol to compare samples two vs two in order to determine which ASVs/Taxons are significatively abundant in one of the samples. As we are comparing abundance among two samples we can use the same library that compare gene counts for RNASeq, that is, DESeq2. From now on I am going to write down all the commands that must be run in R though first of all you must specify the working directory with setwd command.
+
+Let's start loading all the libraries we are going to use to convert QIIME2 artifacts files (qiime2R), process them as phylogenetic data (phyloseq), manipulate tables (readr, tibble, dplyr and tidyr), and to plot the results (ggplot2)
+
+```{r libraries, warning=FALSE, message=FALSE}
+library("phyloseq")
+library("qiime2R")
+library("DESeq2")
+library("readr")
+library("tibble")
+library("dplyr")
+library("tidyr")
+library("ggplot2")
+```
+
+
+First of all we must load the artifact files we have obtained in QIIME2 (metadata, table, taxonomy and tree)
+
+```{r loaddata, message=FALSE}
+metadata<-read_tsv("metadata")
+SVs<-read_qza("table.qza")
+taxonomy<-read_qza("taxa/classification.qza")
+tree<-read_qza("rooted-tree.qza")
+```
+
+Taxonomy object is not suitable for phyloseq so we have to arraange it so that all taxon levels are separated in different columns.
+
+```{r taxtablearr}
+taxtable<-taxonomy$data %>% as_tibble() %>% separate(Taxon, sep="; ",
+                                                  c("Kingdom","Phylum","Class","Order","Family","Genus","Species"))
+```
+
+As not all ASVs are assigned with a resolution of Species R will fill missing data with "NA".
+
+We are ready to build a phyloseq object analogous to artifact in QIIME2. We are going to name it as "physeq" and is going to store all information about samples, metadata, ASVs tables, phylogenetic distances as well as taxonomic assignation. 
+
+```{r physeq}
+physeq<-phyloseq(
+  otu_table(SVs$data, taxa_are_rows = T),
+  phy_tree(tree$data),
+  tax_table(as.data.frame(taxtable) %>% select(-Confidence) %>% column_to_rownames("Feature.ID") %>% as.matrix()),
+  sample_data(metadata %>% as.data.frame() %>% column_to_rownames("sampleid"))
+  )
+```
+
+We can check physeq data:
+```{r seephyseq}
+physeq
+```
+
+In our case, as we are going to analyze samples two by two, we are going to select those that come from agricultural soils (Source="Agr") and that have been kept in a pot (env_feature="Pot"). In other words, we will compare Bulk and SOJ samples from agricultural soils and store them in the object physeqagrsoj:
+
+```{r filterdata}
+physeqagrsoj<-subset_samples(physeq, Source=="Agr" & env_feature=="Pot")
+
+```
+
+Since we are going to work with relative abundances, we are going to eliminate those ASVs that have less than five sequences distributed in the samples and that are present in at least half of the samples. We define the filter in the filtersamp object and apply it with the prune_taxa function to clean the physeqagrsoj object
+```{r filterabundance}
+filtersamp<-genefilter_sample(physeqagrsoj, filterfun_sample(function(x) x > 5), A=0.5*nsamples(physeqagrsoj))
+physeqagrsoj <- prune_taxa(filtersamp, physeqagrsoj)
+
+```
+
+Now we are in terms to begin differential analysis on our data using DESeq2. To do this, first we obtain our DESeq2 object (agrsojdds) in which we indicate that our comparison is going to be regarding the metadata "Plant" and then we perform the analysis using the Wald test.
+
+```{r DESeq}
+agrsojdds <- phyloseq_to_deseq2(physeqagrsoj, ~ Plant)
+agrsojdds <- DESeq(agrsojdds, test="Wald", fitType="parametric")
+
+```
+
+This type of differential analysis is represented as the log2 ratio between two conditions. With the function results in combination with contrasts we have that result. NOTE: constrat needs three parameters, the name of the variable that we are going to analyze, in our case Plant (that can be Bulk or SOJ9, the name of the factor that will be in the numerator (in our case SOJ) and finally the factor that will be in the denominator (Bulk). Therefore: 
+
+```{r results}
+resagrsoj <- results(agrsojdds, cooksCutoff = FALSE, contrast=c("Plant", "SOJ", "Bulk"))
+head(resagrsoj)
+
+```
+As we can see, we have significant and non-significant values, we are going to generate an object in which we store the significant data:
+```{r significant}
+alpha <- 0.01
+agrsojtab <- resagrsoj[which(resagrsoj$padj < alpha &(resagrsoj$log2FoldChange >=1 | resagrsoj$log2FoldChange<=-1)), ]
+head(agrsojtab)
+
+```
+But this table lacks information about the taxonomic assignment for each ASV so we are going to add it:
+```{r significantplustax}
+agrsojtab = cbind(as(agrsojtab, "data.frame"), as(tax_table(physeqagrsoj)[rownames(agrsojtab), ], "matrix"))
+head(agrsojtab)
+```
+Finally, we generated the chart in which we show the Families and Phylos that have a differential abundance (values bigger than 1 are enriched in Soja plants):
+```{r plotgr}
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+
+x = tapply(agrsojtab$log2FoldChange, agrsojtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+agrsojtab$Phylum = factor(as.character(agrsojtab$Phylum), levels=names(x))
+# Family order
+x = tapply(agrsojtab$log2FoldChange, agrsojtab$Family, function(x) max(x))
+x = sort(x, TRUE)
+agrsojtab$Family = factor(as.character(agrsojtab$Family), levels=names(x))
+ggplot(agrsojtab, aes(y=log2FoldChange, x=Family, color=Phylum)) + geom_point(size=4) +
+  theme(axis.text.x = element_text(angle=90, hjust = 0, vjust=0.5)) +
+  geom_hline(yintercept=-1, linetype="dashed", color = "red", size=1.5) +
+  geom_hline(yintercept=1, linetype="dashed", color = "green", size=1.5)
+
+```
+

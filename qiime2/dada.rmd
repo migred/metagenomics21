@@ -1,0 +1,242 @@
+---
+title: "DADA2 pipeline"
+output:
+  html_document:
+    df_print: paged
+---
+
+##Introduction
+
+This is a Notebook containing all the pipeline described in [DADA2 tutorial](https://benjjneb.github.io/dada2/tutorial.html).
+We are using data from article with doi https://doi.org/10.1186/s12866-019-1572-x . This work analyzes the influence of soybean rhizosphere on bacterial communities both in agriculture and forest soil. 16S rRNA gene based bacteria profiling were accomplished with MiSeq 275 bp paired-end sequencing targeted V3-V4 regions, with forward primer 341F = 5′-CCTACGGGNGGCWGCAG-3′ (17bps) and reverse primer 785R = 5′-GACTACHVGGGTATCTAATCC-3 (21 bps). Amplicon size around 445 nts. 
+
+Data was downladed from BioProject PRJNA474716.
+First we check the name of the files with the 16S sequence using list.files. "pattern" uses regular expresion to select the files we are interested in.
+
+```{r checking_sequences , message=FALSE, cache=TRUE }
+library(dada2)
+list.files(path="./fastq/", pattern ="_1.fastq")
+```
+
+
+```{r selecting_files, message=FALSE, cache= TRUE}
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path="./fastq", pattern="_1.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path="./fastq", pattern="_2.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+print("Forward Files list")
+fnFs
+print("Reverse Files list")
+fnRs
+print("Sample names")
+sample.names
+```
+## Inspect read quality profiles
+
+We are going to use two graphical libraries to plot quality graphs (*ggplot2*) and to add an interactive layer (*plotly*).
+```{r graphical_libraries, message=FALSE, cache=TRUE}
+library(ggplot2)
+library(plotly)
+```
+
+We start by visualizing the quality profiles of the forward reads. In this case as we have two samples we select first and second element of fnFs files
+
+```{r forwardfilesquality, message=FALSE, cache=TRUE}
+forwplot<-ggplotly(plotQualityProfile(fnFs[1:length(fnFs)], aggregate = TRUE) +
+                   geom_hline(yintercept=c(15,25,35), color=c("red","blue","green"), size=0.5),
+                   width =750) # %>% layout(width =800)
+forwplot
+```
+In gray-scale is a heat map of the frequency of each quality score at each base position. The median quality score at each position is shown by the green line, and the quartiles of the quality score distribution by the orange lines. The red line shows the scaled proportion of reads that extend to at least that position (this is more useful for other sequencing technologies, as Illumina reads are typically all the same lenghth, hence the flat red line).
+
+The forward reads are good quality. We generally advise trimming the last few nucleotides to avoid less well-controlled errors that can arise there. These quality profiles do not suggest that any additional trimming is needed. As sequence in 5' is low quality and in order to remove primers we will start from position **23** and we will truncate the forward reads at position **265** (trimming the last 10 nucleotides).
+
+Now we visualize the quality profile of the reverse reads:
+
+```{r reversefilesquality, warning = FALSE, message=FALSE, cache=TRUE}
+revqplot<-ggplotly(plotQualityProfile(fnRs[1:length(fnRs)], aggregate=TRUE) + 
+                     geom_hline(yintercept=c(15,25,35), color=c("red","blue","green"), size=0.5),#,ncols=3, nrows= length(fnRs)%/%3+1),
+                   #height=400 * length(fnRs)%/%3+1
+                   width =750 ) #%>% layout(width =800)
+revqplot
+```
+
+To avoid primers we will cut the first 21 nts. Besides,  as expected, reverse sequences have less quality and we are going to fix the position **220** where the quality drops below 26 and we get most of the reads.
+
+## Filter and trim
+Assign the filenames for the filtered fastq.gz files.
+
+```{r namefilterfiles, warning = FALSE, cache = TRUE}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(".", "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(".", "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+We’ll use standard filtering parameters: maxN=0 (DADA2 requires no Ns), truncQ=2, rm.phix=TRUE and maxEE=2. The maxEE parameter sets the maximum number of “expected errors” allowed in a read, which is a better filter than simply averaging quality scores.
+
+```{r filtering, warning = FALSE, cache=TRUE}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, trimLeft=c(23,21), truncLen=c(265,220),
+              maxN=0, maxEE=c(2,5), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+out
+print("Total Reads")
+sum(out[,2])
+```
+
+**Considerations for your own data**: The standard filtering parameters are starting points, not set in stone. If you want to speed up downstream computation, consider tightening maxEE. If too few reads are passing the filter, consider relaxing maxEE, perhaps especially on the reverse reads (eg. maxEE=c(2,5)), and reducing the truncLen to remove low quality tails. Remember though, when choosing truncLen for paired-end reads you must maintain overlap after truncation in order to merge them later. 
+
+**Primers consideration**: Important to define with trimLeft the length of primers. I have run the whole protocol without removing them and in the Chimera removal step I lost around 62% of sequences.
+
+**Considerations for your own data**: For ITS sequencing, it is usually undesirable to truncate reads to a fixed length due to the large length variation at that locus. That is OK, just leave out truncLen. See the [DADA2 ITS workflow](https://benjjneb.github.io/dada2/ITS_workflow.html) for more information
+
+## Learn the Error Rates
+
+The DADA2 algorithm makes use of a parametric error model (err) and every amplicon dataset has a different set of error rates. The learnErrors method learns this error model from the data, by alternating estimation of the error rates and inference of sample composition until they converge on a jointly consistent solution. As in many machine-learning problems, the algorithm must begin with an initial guess, for which the maximum possible error rates in this data are used (the error rates if only the most abundant sequence is correct and all the rest are errors). By default learnErrors is using 1+e8 nucleotides to infer the model, but depending in the number of samples or computer memory this value can be modified. Nevertheless the lower the number, the less reliable the model will be.
+
+
+```{r errForward, cache = TRUE}
+errF <- learnErrors(filtFs,multithread=TRUE, nbases=100000)
+```
+
+``` {r errReverse, cache = TRUE}
+errR <- learnErrors(filtRs, multithread=TRUE, nbases=100000)
+```
+
+It is always worthwhile, as a sanity check if nothing else, to visualize the estimated error rates:
+```{r ploterrorsF, message= FALSE, warning= FALSE, cache = TRUE}
+plotErrors(errF, nominalQ=TRUE)
+```
+```{r ploterrorsR, message= FALSE, warning= FALSE, cache = TRUE}
+plotErrors(errR, nominalQ=TRUE)
+```
+
+The error rates for each possible transition (A→C, A→G, …) are shown. Points are the observed error rates for each consensus quality score. The black line shows the estimated error rates after convergence of the machine-learning algorithm. The red line shows the error rates expected under the nominal definition of the Q-score. Here the estimated error rates (black line) are a good fit to the observed rates (points), and the error rates drop with increased quality as expected. Everything looks reasonable and we proceed with confidence.
+
+ 
+## Sample Inference
+
+We are now ready to apply the [core sample inference algorithm](https://www.nature.com/articles/nmeth.3869#methods) to the filtered and trimmed sequence data.
+
+```{r dadaF, warning=FALSE, cache=TRUE}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+```
+
+```{r dadaR, warning=FALSE, cache=TRUE}
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+```
+Inspecting the returned dada-class object:
+```{r dadaview, warning=FALSE, cache=TRUE}
+print("Forward Reads")
+dadaFs[[1]]
+print("Reverse Reads")
+dadaRs[[1]]
+```
+The DADA2 algorithm inferred 3387 true sequence variants from the 60111 unique sequences in the first sample and in forward reads. There is much more to the dada-class return object than this (see help("dada-class") for some info), including multiple diagnostics about the quality of each denoised sequence variant, but that is beyond the scope of an introductory tutorial.
+
+## Merge paired reads
+
+We now merge the forward and reverse reads together to obtain the full denoised sequences. Merging is performed by aligning the denoised forward reads with the reverse-complement of the corresponding denoised reverse reads, and then constructing the merged “contig” sequences. By default, merged sequences are only output if the forward and reverse reads overlap by at least **12** bases, and are identical to each other in the overlap region (but these conditions can be changed via function arguments).
+
+```{r merging, message=FALSE, warning=FALSE, cache=TRUE}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]][,2:9])
+```
+The mergers object is a list of data.frames from each sample. Each data.frame contains the merged $sequence, its $abundance, and the indices of the $forward and $reverse sequence variants that were merged. Paired reads that did not exactly overlap were removed by mergePairs, further reducing spurious output.
+
+**Considerations for your own data**: Most of your reads should successfully merge. If that is not the case upstream parameters may need to be revisited: Did you trim away the overlap between your reads?
+
+**Extensions**: Non-overlapping reads are supported, but not recommended, with mergePairs(..., justConcatenate=TRUE).Check for ITS.
+
+## Construct Sequence Table
+
+We can now construct an amplicon sequence variant table (ASV) table, a higher-resolution version of the OTU table produced by traditional methods.
+
+```{r seqtable , warning = FALSE, cache = TRUE}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+```{r inspecttable, warning = FALSE, cache = TRUE}
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+ 
+The sequence table is a matrix with rows corresponding to (and named by) the samples, and columns corresponding to (and named by) the sequence variants. This table contains 91630 ASVs, but not all the lengths of our merged sequences all fall within the expected range for this V3-V4 amplicon.  We are going to remove them all ASVs below 394 nts.
+
+```{r filteringseq, warning = FALSE, cache = TRUE}
+seqtab<- seqtab[,nchar(colnames(seqtab)) %in% 390:429]
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))               
+```
+
+## Remove chimeras
+
+The core dada method corrects substitution and indel errors, but chimeras remain. Fortunately, the accuracy of sequence variants after denoising makes identifying chimeric ASVs simpler than when dealing with fuzzy OTUs. Chimeric sequences are identified if they can be exactly reconstructed by combining a left-segment and a right-segment from two more abundant “parent” sequences.
+
+```{r chimeras, warning=FALSE, cache=TRUE }
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+print("Removing chimera")
+dim(seqtab.nochim)
+print("Percentage against original sequences")
+sum(seqtab.nochim)/sum(seqtab)*100
+
+```
+
+**WARNING**: Check filtering step if number of sequences drops drastically. 
+
+## Track reads through the pipeline
+
+As a final check of the progress, we'll look at the number of reads that made through each step in the pipeline:
+
+```{r pipeline_summary, warning=FALSE, cache=TRUE}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+track
+```
+
+## Finishing
+
+Assuming that we want to start with dada2 in R and move to taxonomy assignments and different analysis in qiime2 (e.g following q2 tutorials like Moving Pictures etc.). First we have to export results, table, representative sequences and stats:
+
+```{r export_resutls, warning=FALSE, cache = TRUE}
+#Let's codify feature names in MD5 to have similar names to those obtained in qiime2
+library(openssl)
+seqtab.nochimmd5 <-seqtab.nochim
+sequences <- colnames(seqtab.nochimmd5)
+sequencesmd5<-md5(sequences)
+colnames(seqtab.nochimmd5)<-sequencesmd5
+write.table(t(seqtab.nochimmd5), "seqtab-nochim.txt", sep="\t", row.names=TRUE, col.names=NA, quote=FALSE)
+uniquesToFasta(seqtab.nochim, fout='rep-seqs.fna', ids=sequencesmd5)
+write.table(t(track), "stats.txt", sep="\t", row.names=TRUE, col.names=NA, quote=FALSE)
+```
+
+
+Later on in terminal qiime2:
+
+    
+    qiime tools import \
+    --input-path rep-seqs.fna \
+    --type 'FeatureData[Sequence]' \
+    --output-path rep-seqs.qza
+
+    
+    echo -n "#OTU Table" | cat - seqtab-nochim.txt > biom-table.txt
+
+    
+    biom convert -i biom-table.txt -o table.biom --table-type="OTU table" --to-hdf5
+
+    
+    qiime tools import \
+    --input-path table.biom \
+    --type 'FeatureTable[Frequency]' \
+    --input-format BIOMV210Format \
+    --output-path table.qza
+
+
