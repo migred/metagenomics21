@@ -2,21 +2,41 @@
 title: "DADA2 pipeline"
 output:
   html_document:
+    toc: true
     df_print: paged
 ---
 
-##Introduction
+## Introduction
 
 This is a Notebook containing all the pipeline described in [DADA2 tutorial](https://benjjneb.github.io/dada2/tutorial.html).
 We are using data from article with doi https://doi.org/10.1186/s12866-019-1572-x . This work analyzes the influence of soybean rhizosphere on bacterial communities both in agriculture and forest soil. 16S rRNA gene based bacteria profiling were accomplished with MiSeq 275 bp paired-end sequencing targeted V3-V4 regions, with forward primer 341F = 5′-CCTACGGGNGGCWGCAG-3′ (17bps) and reverse primer 785R = 5′-GACTACHVGGGTATCTAATCC-3 (21 bps). Amplicon size around 445 nts. 
 
 Data was downladed from BioProject PRJNA474716.
+
+## Loading needed libraries
+
+```{r libraries, message=FALSE, cache=TRUE, warning=FALSE}
+library(dada2)
+library(openssl)
+library(Biostrings)
+library(ShortRead)
+library(markdown)
+```
+
+We are going to use two graphical libraries to plot quality graphs (*ggplot2*) and to add an interactive layer (*plotly*).
+
+```{r graphical_libraries, message=FALSE, cache=TRUE, warning=FALSE}
+library(ggplot2)
+library(plotly)
+```
+
+## Input files 
 First we check the name of the files with the 16S sequence using list.files. "pattern" uses regular expresion to select the files we are interested in.
 
 ```{r checking_sequences , message=FALSE, cache=TRUE }
-library(dada2)
 list.files(path="./fastq/", pattern ="_1.fastq")
 ```
+
 
 
 ```{r selecting_files, message=FALSE, cache= TRUE}
@@ -33,37 +53,119 @@ fnRs
 print("Sample names")
 sample.names
 ```
+## Cutting primers
+We have also to specify cutadapt ubication so that we can remove the primers. So let's write down the path of the program (in this case */home/condapython/anaconda3/bin/cutadapt*) and check with system2 wether we can run it
+
+```{r cutadapt}
+cutadapt<-"/home/condapython/anaconda3/bin/cutadapt"
+system2(cutadapt, args = "--version")
+```
+
+
+Let's define first the primers and their corresponding reverse complement sequences.
+
+```{r primers}
+FWD<- "CCTACGGGNGGCWGCAG"
+REV <- "GACTACHVGGGTATCTAATCC"
+allOrients <- function(primer) {
+    # Create all orientations of the input sequence
+    require(Biostrings)
+    dna <- DNAString(primer)  # The Biostrings works w/ DNAString objects rather than character vectors
+    orients <- c(Forward = dna, Complement = Biostrings::complement(dna), Reverse = reverse(dna), 
+        RevComp = reverseComplement(dna))
+    return(sapply(orients, toString))  # Convert back to character vector
+}
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+
+```
+
+Next, we have to check whether those sequences are appearing or not
+
+```{r primer_count}
+primerHits <- function(primer, fn) {
+    # Counts number of reads in which the primer is found
+    nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+    return(sum(nhits > 0))
+}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs[[1]]), 
+    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs[[1]]), 
+    REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs[[1]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs[[1]]))
+```
+Now we are going to prepare a directory to contain the trimmed sequences after running cutadapt
+
+```{r cutadapt_run}
+# Create an output directory to store the clipped files
+cut_dir <- file.path(".", "cutadapt")
+if (!dir.exists(cut_dir)) dir.create(cut_dir)
+
+fnFs.cut <- file.path(cut_dir, basename(fnFs))
+fnRs.cut <- file.path(cut_dir, basename(fnRs))
+
+FWD.RC <- dada2:::rc(FWD)
+REV.RC <- dada2:::rc(REV)
+
+names(fnFs.cut) <- sample.names
+names(fnRs.cut) <- sample.names
+
+#Define minimum length of reads to keep after trimming
+
+minlen <- 150
+# It's good practice to keep some log files so let's create some
+# file names that we can use for those 
+cut_logs <- path.expand(file.path(cut_dir, paste0(sample.names, ".log")))
+
+cutadapt_args <- c("-g", FWD, "-a", REV.RC, 
+                   "-G", REV, "-A", FWD.RC,
+                   "-n", 2, "--discard-untrimmed", "--minimum-length", minlen)
+
+# Loop over the list of files, running cutadapt on each file.  If you don't have a vector of sample names or 
+# don't want to keep the log files you can set stdout = "" to output to the console or stdout = NULL to discard
+for (i in seq_along(fnFs)) {
+  system2(cutadapt, 
+          args = c(cutadapt_args,
+                   "-o", fnFs.cut[i], "-p", fnRs.cut[i], 
+                   fnFs[i], fnRs[i]),
+          stdout = cut_logs[i])  
+}
+
+# quick check that we got something
+head(list.files(cut_dir))
+```
+
+Let's look for the presence of adapters in cut files
+
+```{r cutadapt check}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.cut[[1]]), 
+    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.cut[[1]]), 
+    REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.cut[[1]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.cut[[1]]))
+```
 ## Inspect read quality profiles
 
-We are going to use two graphical libraries to plot quality graphs (*ggplot2*) and to add an interactive layer (*plotly*).
-```{r graphical_libraries, message=FALSE, cache=TRUE}
-library(ggplot2)
-library(plotly)
-```
+
 
 We start by visualizing the quality profiles of the forward reads. In this case as we have two samples we select first and second element of fnFs files
 
 ```{r forwardfilesquality, message=FALSE, cache=TRUE}
-forwplot<-ggplotly(plotQualityProfile(fnFs[1:length(fnFs)], aggregate = TRUE) +
-                   geom_hline(yintercept=c(15,25,35), color=c("red","blue","green"), size=0.5),
-                   width =750) # %>% layout(width =800)
+forwplot<-ggplotly(plotQualityProfile(fnFs.cut[1:length(fnFs.cut)], aggregate = TRUE) +
+                   geom_hline(yintercept=c(15,25,35), color=c("red","blue","green"), size=0.5), width =600) 
 forwplot
 ```
 In gray-scale is a heat map of the frequency of each quality score at each base position. The median quality score at each position is shown by the green line, and the quartiles of the quality score distribution by the orange lines. The red line shows the scaled proportion of reads that extend to at least that position (this is more useful for other sequencing technologies, as Illumina reads are typically all the same lenghth, hence the flat red line).
 
-The forward reads are good quality. We generally advise trimming the last few nucleotides to avoid less well-controlled errors that can arise there. These quality profiles do not suggest that any additional trimming is needed. As sequence in 5' is low quality and in order to remove primers we will start from position **23** and we will truncate the forward reads at position **265** (trimming the last 10 nucleotides).
+The forward reads are good quality. We generally advise trimming the last few nucleotides to avoid less well-controlled errors that can arise there. These quality profiles do not suggest that any additional trimming is needed. As sequence in 5' is low quality and in order to remove primers we will start from position **7** and we will truncate the forward reads at position **255** (trimming the last 10 nucleotides).
 
 Now we visualize the quality profile of the reverse reads:
 
 ```{r reversefilesquality, warning = FALSE, message=FALSE, cache=TRUE}
-revqplot<-ggplotly(plotQualityProfile(fnRs[1:length(fnRs)], aggregate=TRUE) + 
-                     geom_hline(yintercept=c(15,25,35), color=c("red","blue","green"), size=0.5),#,ncols=3, nrows= length(fnRs)%/%3+1),
-                   #height=400 * length(fnRs)%/%3+1
-                   width =750 ) #%>% layout(width =800)
+revqplot<-ggplotly(plotQualityProfile(fnRs.cut[1:length(fnRs)], aggregate=TRUE) + 
+                     geom_hline(yintercept=c(15,25,35), color=c("red","blue","green"), size=0.5), width =750 ) 
 revqplot
 ```
 
-To avoid primers we will cut the first 21 nts. Besides,  as expected, reverse sequences have less quality and we are going to fix the position **220** where the quality drops below 26 and we get most of the reads.
+Besides,  as expected, reverse sequences have less quality and we are going to fix the position **234** where the quality drops below 26 and we get most of the reads.
 
 ## Filter and trim
 Assign the filenames for the filtered fastq.gz files.
@@ -79,7 +181,7 @@ names(filtRs) <- sample.names
 We’ll use standard filtering parameters: maxN=0 (DADA2 requires no Ns), truncQ=2, rm.phix=TRUE and maxEE=2. The maxEE parameter sets the maximum number of “expected errors” allowed in a read, which is a better filter than simply averaging quality scores.
 
 ```{r filtering, warning = FALSE, cache=TRUE}
-out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, trimLeft=c(23,21), truncLen=c(265,220),
+out <- filterAndTrim(fnFs.cut, filtFs, fnRs.cut, filtRs, trimLeft=c(7,0), truncLen=c(255,234),
               maxN=0, maxEE=c(2,5), truncQ=2, rm.phix=TRUE,
               compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
 out
@@ -168,7 +270,7 @@ table(nchar(getSequences(seqtab)))
 The sequence table is a matrix with rows corresponding to (and named by) the samples, and columns corresponding to (and named by) the sequence variants. This table contains 91630 ASVs, but not all the lengths of our merged sequences all fall within the expected range for this V3-V4 amplicon.  We are going to remove them all ASVs below 394 nts.
 
 ```{r filteringseq, warning = FALSE, cache = TRUE}
-seqtab<- seqtab[,nchar(colnames(seqtab)) %in% 390:429]
+seqtab<- seqtab[,nchar(colnames(seqtab)) %in% 390:432]
 # Inspect distribution of sequence lengths
 table(nchar(getSequences(seqtab)))               
 ```
@@ -207,7 +309,7 @@ Assuming that we want to start with dada2 in R and move to taxonomy assignments 
 
 ```{r export_resutls, warning=FALSE, cache = TRUE}
 #Let's codify feature names in MD5 to have similar names to those obtained in qiime2
-library(openssl)
+
 seqtab.nochimmd5 <-seqtab.nochim
 sequences <- colnames(seqtab.nochimmd5)
 sequencesmd5<-md5(sequences)
